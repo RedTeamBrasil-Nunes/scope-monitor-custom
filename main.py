@@ -22,7 +22,7 @@ from javax.swing.table import DefaultTableCellRenderer;
 from javax.swing.table import DefaultTableModel;
 from javax.swing.table import TableColumn;
 from javax.swing.table import TableColumnModel;
-from threading import Lock
+from threading import Lock, Thread
 
 ###
 from java.awt import Color
@@ -36,6 +36,7 @@ from java.awt.event import ActionListener
 from java.awt import BorderLayout
 from java.awt import GridLayout
 from javax.swing import JTextArea
+from javax.swing import JTextField
 from javax.swing import ButtonGroup
 from javax.swing import JRadioButton
 from javax.swing import JLabel
@@ -48,6 +49,8 @@ from java.lang import Runnable
 from javax.swing import RowFilter
 from java.awt.event import ItemListener
 from javax.swing.table import TableRowSorter
+from javax.swing.event import DocumentListener
+from java.util.regex import Pattern
 from urlparse import *
 import datetime 
 import time
@@ -63,7 +66,7 @@ SHOW_TEST_BUTTON_LABEL = "Show Tested Only"
 MONITOR_ON_LABEL = "Monitor is ON"
 MONITOR_OFF_LABEL = "Monitor is OFF"
 
-SCOPE_MONITOR_COMMENT = "scope-monitor-placeholder"
+SCOPE_MONITOR_COMMENT = "RTB-History-Monitor"
 
 TAGS = ['Login', 'Logout', 'MFA', 'PII']
 
@@ -81,7 +84,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self._helpers = callbacks.getHelpers()
         
         # set our extension name
-        callbacks.setExtensionName("Burp Scope Monitor - Custom")
+        callbacks.setExtensionName("RTB History Monitor")
 
         self.GLOBAL_HANDLER_ANALYZED = False
         self.GLOBAL_HANDLER = False
@@ -90,7 +93,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self.AUTOSAVE_TIMEOUT  = 180 # 3 minutes
         self.CONFIG_INSCOPE    = True
 
-        self.BAD_EXTENSIONS_DEFAULT = ['.gif', '.png', '.js', '.woff', '.woff2', '.jpeg', '.jpg', '.css', '.ico', '.m3u8', '.ts']
+        self.BAD_EXTENSIONS_DEFAULT = ['.gif', '.png', '.woff', '.woff2', '.jpeg', '.jpg', '.css', '.ico', '.m3u8', '.ts']
         self.BAD_MIMES_DEFAULT      = ['gif', 'script', 'jpeg', 'jpg', 'png', 'video', 'mp2t']
         
         self.BAD_EXTENSIONS = self.BAD_EXTENSIONS_DEFAULT
@@ -205,18 +208,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self.scopeOptionButton.addActionListener(self.handleScopeOptionButton)
         self.scopeOptionButton.setBounds(50, 350, 420, 30)
 
-        self.startOptionButton = JCheckBox("Autostart Scope Monitor")
+        self.startOptionButton = JCheckBox("Autostart RTB History Monitor")
         self.startOptionButton.setSelected(True)
         self.startOptionButton.addActionListener(self.handleStartOption)
         self.startOptionButton.setBounds(50, 370, 420, 30)
 
         self.markTestedRequestsProxy = JCheckBox("Color request in Proxy tab if analyzed")
-        self.markTestedRequestsProxy.setSelected(True)
+        self.markTestedRequestsProxy.setSelected(False)
         self.markTestedRequestsProxy.addActionListener(self.handleTestedRequestsProxy)
         self.markTestedRequestsProxy.setBounds(50, 390, 420, 30)
 
         self.markNotTestedRequestsProxy = JCheckBox("Color request in Proxy tab if NOT analyzed")
-        self.markNotTestedRequestsProxy.setSelected(True)
+        self.markNotTestedRequestsProxy.setSelected(False)
         self.markNotTestedRequestsProxy.addActionListener(self.handleNotTestedRequestsProxy)
         self.markNotTestedRequestsProxy.setBounds(50, 410, 420, 30)
 
@@ -284,7 +287,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         ##### end config pane
 
 
-        self._parentPane.addTab("Monitor", self._splitpane)
+        # Search and coverage bar
+        topBar = JPanel(BorderLayout())
+        searchPanel = JPanel(BorderLayout())
+        searchLabel = JLabel("  Filter: ")
+        self.searchField = JTextField()
+        self.searchField.getDocument().addDocumentListener(SearchDocListener(self))
+
+        self.coverageLabel = JLabel("  Showing: 0 | Tested: 0/0 (0%)  ")
+
+        searchPanel.add(searchLabel, BorderLayout.WEST)
+        searchPanel.add(self.searchField, BorderLayout.CENTER)
+
+        topBar.add(searchPanel, BorderLayout.CENTER)
+        topBar.add(self.coverageLabel, BorderLayout.EAST)
+
+        self._monitorPanel = JPanel(BorderLayout())
+        self._monitorPanel.add(topBar, BorderLayout.NORTH)
+        self._monitorPanel.add(self._splitpane, BorderLayout.CENTER)
+
+        self._parentPane.addTab("Monitor", self._monitorPanel)
         self._parentPane.addTab("Config", self._config)
         
         # table of log entries
@@ -384,37 +406,39 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         print "Loaded!"
         self.SC = sched.scheduler(time.time, time.sleep)
         self.SCC = self.SC.enter(10, 1, self.autoSave, (self.SC,))
-        self.SC.run()
+        self._schedulerThread = Thread(target=self.SC.run)
+        self._schedulerThread.daemon = True
+        self._schedulerThread.start()
 
         return
         
     ##### CUSTOM CODE #####
     def loadConfigs(self):
 
-        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSTART") == "True":
-            self.startOptionButton.setSelected(True)
-            self.startOrStop(None, True)
-        else:
+        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSTART") == "False":
             self.startOptionButton.setSelected(False)
             self.startOrStop(None, False)
+        else:
+            self.startOptionButton.setSelected(True)
+            self.startOrStop(None, True)
 
-        if self._callbacks.loadExtensionSetting("exportFile") != "":
+        if self._callbacks.loadExtensionSetting("exportFile") != "" and self._callbacks.loadExtensionSetting("exportFile") is not None:
             self.selectPathText.setText(self._callbacks.loadExtensionSetting("exportFile"))
 
-        if self._callbacks.loadExtensionSetting("CONFIG_REPEATER") == "True":
-            self.repeaterOptionButton.setSelected(True)
-        else:
+        if self._callbacks.loadExtensionSetting("CONFIG_REPEATER") == "False":
             self.repeaterOptionButton.setSelected(False)
-
-        if self._callbacks.loadExtensionSetting("CONFIG_INSCOPE") == "True":
-            self.scopeOptionButton.setSelected(True)
         else:
+            self.repeaterOptionButton.setSelected(True)
+
+        if self._callbacks.loadExtensionSetting("CONFIG_INSCOPE") == "False":
             self.scopeOptionButton.setSelected(False)
-
-        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSAVE") == "True":
-            self.autoSaveOption.setSelected(True)
         else:
+            self.scopeOptionButton.setSelected(True)
+
+        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSAVE") == "False":
             self.autoSaveOption.setSelected(False)
+        else:
+            self.autoSaveOption.setSelected(True)
         
         if self._callbacks.loadExtensionSetting("CONFIG_HIGHLIGHT_TESTED") == "True":
             self.markTestedRequestsProxy.setSelected(True)
@@ -592,7 +616,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     def handleBadMimesDefaultButton(self, event):
         self.BAD_MIMES = self.BAD_MIMES_DEFAULT
         self.badMimesText.setText(", ".join(self.BAD_MIMES))
-        self._callbacks.saveExtensionSetting("badExtensions", ", ".join(self.BAD_MIMES))
+        self._callbacks.saveExtensionSetting("badMimes", ", ".join(self.BAD_MIMES))
         return
 
     def handleBadMimesButton(self, event):
@@ -652,7 +676,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     #
     
     def getTabCaption(self):
-        return "Scope Monitor - Custom"
+        return "RTB History Monitor"
     
     def getUiComponent(self):
         return self._parentPane
@@ -760,7 +784,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         #print 'in httpmessage, response:'
         #print self._helpers.analyzeResponse(messageInfo.getResponse())
 
-        date = datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S %d %b %Y')
+        date = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
         entry = LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), url, analyzed, date, method)
         #print "toolFlag: " + str(toolFlag)
 
@@ -1004,6 +1028,48 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         date = datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S')
         return date
 
+    def updateCoverage(self):
+        try:
+            total = self._fullLog.size()
+            tested = 0
+            for item in self._fullLog:
+                if item._analyzed:
+                    tested += 1
+
+            showing = self.logTable.getRowCount()
+
+            if total > 0:
+                pct = int(100.0 * tested / total)
+            else:
+                pct = 0
+
+            text = "  Showing: %d | Tested: %d/%d (%d%%)  " % (showing, tested, total, pct)
+            self.coverageLabel.setText(text)
+        except:
+            pass
+
+    def applySearchFilter(self):
+        text = self.searchField.getText()
+        sorter = self.logTable.getRowSorter()
+        if sorter is None:
+            return
+        if text and text.strip():
+            try:
+                sorter.setRowFilter(RowFilter.regexFilter("(?i)" + Pattern.quote(text.strip())))
+            except:
+                pass
+        else:
+            sorter.setRowFilter(None)
+        self.updateCoverage()
+
+    def fireTableDataChanged(self):
+        AbstractTableModel.fireTableDataChanged(self)
+        self.updateCoverage()
+
+    def fireTableRowsInserted(self, firstRow, lastRow):
+        AbstractTableModel.fireTableRowsInserted(self, firstRow, lastRow)
+        self.updateCoverage()
+
 #
 # extend JTable to handle cell selection
 #
@@ -1131,19 +1197,23 @@ class deleteRequestHandler(ActionListener):
         self._extender = extender
 
     def actionPerformed(self, e):
-        #print "COPY SELECTED URL HANDLER ******"
-
         rows = self._extender.logTable.getSelectedRows()
-        to_delete = []
 
-        for row in rows:
+        # Convert view indices to model indices and sort descending
+        # to avoid index shift when removing items
+        model_rows = sorted(
+            [self._extender.logTable.convertRowIndexToModel(row) for row in rows],
+            reverse=True
+        )
 
-            model_row = self._extender.logTable.convertRowIndexToModel(row)
-
-            self._extender._log.remove(self._extender._log.get(model_row))
+        self._extender._lock.acquire()
+        for model_row in model_rows:
+            entry = self._extender._log.get(model_row)
+            self._extender._log.remove(entry)
+            self._extender._fullLog.remove(entry)
+        self._extender._lock.release()
 
         self._extender.fireTableDataChanged()
-        #print 'refreshing view ..... *****'
 
         return 
 
@@ -1286,3 +1356,17 @@ class localTagHandler(ActionListener):
             self._extender._lock.release()
 
         SwingUtilities.invokeLater(lambda: self._extender.fireTableDataChanged())
+
+
+class SearchDocListener(DocumentListener):
+    def __init__(self, extender):
+        self._extender = extender
+
+    def insertUpdate(self, e):
+        self._extender.applySearchFilter()
+
+    def removeUpdate(self, e):
+        self._extender.applySearchFilter()
+
+    def changedUpdate(self, e):
+        self._extender.applySearchFilter()
